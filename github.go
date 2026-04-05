@@ -10,8 +10,14 @@ import (
 	"time"
 )
 
-const githubGraphQLURL = "https://api.github.com/graphql"
-const githubRESTURL = "https://api.github.com"
+var githubGraphQLURL = "https://api.github.com/graphql"
+var githubRESTURL = "https://api.github.com"
+
+// setGitHubURLs overrides the API base URLs (used by tests).
+func setGitHubURLs(graphQL, rest string) {
+	githubGraphQLURL = graphQL
+	githubRESTURL = rest
+}
 
 // GitHubClient handles GitHub API interactions for project lifecycle management.
 type GitHubClient struct {
@@ -270,6 +276,50 @@ This feature has been marked as **dead** by the health monitoring system.
 	}
 
 	return result.HTMLURL, nil
+}
+
+// HasOpenBug checks whether an open bug issue already exists for a given alert name.
+// Used as a restart safety net — prevents duplicate bug creation when in-memory state is lost.
+func (c *GitHubClient) HasOpenBug(repo, alertName string) (bool, error) {
+	url := fmt.Sprintf("%s/repos/%s/%s/issues?labels=bug&state=open&per_page=50", githubRESTURL, c.org, repo)
+
+	req, err := http.NewRequest("GET", url, nil)
+	if err != nil {
+		return false, err
+	}
+	req.Header.Set("Authorization", "Bearer "+c.token)
+	req.Header.Set("Accept", "application/vnd.github+json")
+
+	resp, err := c.httpClient.Do(req)
+	if err != nil {
+		return false, fmt.Errorf("http request: %w", err)
+	}
+	defer resp.Body.Close()
+
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return false, fmt.Errorf("read response: %w", err)
+	}
+
+	if resp.StatusCode != http.StatusOK {
+		return false, fmt.Errorf("github API returned %d: %s", resp.StatusCode, string(body))
+	}
+
+	var issues []struct {
+		Title string `json:"title"`
+	}
+	if err := json.Unmarshal(body, &issues); err != nil {
+		return false, fmt.Errorf("parse issues: %w", err)
+	}
+
+	prefix := fmt.Sprintf("[Bug] %s is dead", alertName)
+	for _, issue := range issues {
+		if len(issue.Title) >= len(prefix) && issue.Title[:len(prefix)] == prefix {
+			return true, nil
+		}
+	}
+
+	return false, nil
 }
 
 // AddIssueComment adds a comment to a GitHub Issue via REST API.

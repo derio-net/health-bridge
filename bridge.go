@@ -12,7 +12,8 @@ import (
 
 // Bridge is the core service that processes Grafana alerts and updates GitHub.
 type Bridge struct {
-	github *GitHubClient
+	github    *GitHubClient
+	lastState map[string]string // issueRef → last lifecycle state (dedup)
 }
 
 // GrafanaPayload is the webhook payload sent by Grafana alerting.
@@ -38,7 +39,7 @@ func NewBridge(token, org string, projectNumber int) (*Bridge, error) {
 	if err != nil {
 		return nil, fmt.Errorf("github client init: %w", err)
 	}
-	return &Bridge{github: gh}, nil
+	return &Bridge{github: gh, lastState: make(map[string]string)}, nil
 }
 
 // Ready returns true if the bridge has loaded project metadata.
@@ -100,25 +101,44 @@ func (b *Bridge) processAlert(alert Alert) error {
 
 	newState := MapAlertToState(alert.Status, alert.Labels["severity"])
 
-	// Update lifecycle state on project board
+	// Update lifecycle state on project board (idempotent — always safe)
 	if err := b.github.UpdateLifecycleState(repo, number, newState); err != nil {
 		return fmt.Errorf("update lifecycle %s → %s: %w", issueRef, newState, err)
+	}
+
+	// Dedup: only comment and create bugs on actual state transitions
+	prevState := b.lastState[issueRef]
+	b.lastState[issueRef] = newState
+
+	if prevState == newState {
+		log.Printf("Dedup: %s already %s, skipping comment/bug", issueRef, newState)
+		return nil
 	}
 
 	// Add comment to issue with alert context
 	comment := FormatComment(alert, newState)
 	if err := b.github.AddIssueComment(repo, number, comment); err != nil {
 		log.Printf("Warning: failed to add comment to %s (state update succeeded): %v", issueRef, err)
-		// Non-fatal: the state update is the critical action
 	}
 
 	// On dead transition, create a bug Issue linked to the feature Issue
 	if newState == "dead" {
-		bugURL, err := b.github.CreateBugIssue(repo, number, alert)
+		// Safety net: check for existing open bug before creating (handles restarts)
+		alertName := alert.Labels["alertname"]
+		exists, err := b.github.HasOpenBug(repo, alertName)
 		if err != nil {
-			log.Printf("Warning: failed to create bug issue for %s: %v", issueRef, err)
+			log.Printf("Warning: failed to check for existing bug for %s: %v", issueRef, err)
+			// Fall through to create — better a duplicate than a missing bug
+		}
+		if exists {
+			log.Printf("Dedup: open bug already exists for %s in %s, skipping creation", alertName, repo)
 		} else {
-			log.Printf("Created bug issue: %s", bugURL)
+			bugURL, err := b.github.CreateBugIssue(repo, number, alert)
+			if err != nil {
+				log.Printf("Warning: failed to create bug issue for %s: %v", issueRef, err)
+			} else {
+				log.Printf("Created bug issue: %s", bugURL)
+			}
 		}
 	}
 

@@ -88,6 +88,126 @@ func TestFormatComment(t *testing.T) {
 	}
 }
 
+func TestProcessAlert_DedupSkipsRepeatState(t *testing.T) {
+	// Track what the mock GitHub server receives
+	var commentCount, bugCount int
+
+	mockGH := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		// GraphQL requests (lifecycle updates)
+		if r.URL.Path == "/graphql" {
+			w.WriteHeader(http.StatusOK)
+			json.NewEncoder(w).Encode(map[string]any{
+				"data": map[string]any{
+					"repository": map[string]any{
+						"issue": map[string]any{
+							"projectItems": map[string]any{
+								"nodes": []map[string]any{
+									{"id": "item-1", "project": map[string]any{"id": "proj-1"}},
+								},
+							},
+						},
+					},
+					"updateProjectV2ItemFieldValue": map[string]any{
+						"projectV2Item": map[string]any{"id": "item-1"},
+					},
+				},
+			})
+			return
+		}
+
+		// REST: issue comments
+		if r.Method == "POST" && r.URL.Path == "/repos/derio-net/willikins/issues/11/comments" {
+			commentCount++
+			w.WriteHeader(http.StatusCreated)
+			json.NewEncoder(w).Encode(map[string]any{"id": 1})
+			return
+		}
+
+		// REST: bug issue search (GET issues with bug label)
+		if r.Method == "GET" && r.URL.Path == "/repos/derio-net/willikins/issues" {
+			w.WriteHeader(http.StatusOK)
+			json.NewEncoder(w).Encode([]map[string]any{})
+			return
+		}
+
+		// REST: create bug issue
+		if r.Method == "POST" && r.URL.Path == "/repos/derio-net/willikins/issues" {
+			bugCount++
+			w.WriteHeader(http.StatusCreated)
+			json.NewEncoder(w).Encode(map[string]any{"html_url": "https://github.com/derio-net/willikins/issues/99"})
+			return
+		}
+
+		w.WriteHeader(http.StatusOK)
+		json.NewEncoder(w).Encode(map[string]any{})
+	}))
+	defer mockGH.Close()
+
+	bridge := &Bridge{
+		github: &GitHubClient{
+			token:         "test",
+			org:           "derio-net",
+			projectID:     "proj-1",
+			fieldID:       "field-1",
+			optionIDs:     map[string]string{"healthy": "opt-1", "dead": "opt-2", "degraded": "opt-3"},
+			httpClient:    mockGH.Client(),
+			projectNumber: 1,
+		},
+		lastState: make(map[string]string),
+	}
+
+	// Override the GitHub API URLs to point at mock
+	origGraphQL := githubGraphQLURL
+	origREST := githubRESTURL
+	defer func() {
+		setGitHubURLs(origGraphQL, origREST)
+	}()
+	setGitHubURLs(mockGH.URL+"/graphql", mockGH.URL)
+
+	alert := Alert{
+		Status:      "firing",
+		Labels:      map[string]string{"alertname": "Exercise Reminder Stale", "severity": "critical", "github_issue": "willikins#11"},
+		Annotations: map[string]string{"summary": "Exercise reminder heartbeat is stale"},
+		StartsAt:    "2026-04-05T02:00:00Z",
+		Fingerprint: "abc123",
+	}
+
+	// First call: should process fully (comment + bug)
+	if err := bridge.processAlert(alert); err != nil {
+		t.Fatalf("First processAlert failed: %v", err)
+	}
+	if commentCount != 1 {
+		t.Errorf("First call: expected 1 comment, got %d", commentCount)
+	}
+	if bugCount != 1 {
+		t.Errorf("First call: expected 1 bug, got %d", bugCount)
+	}
+
+	// Second call with same state: should be deduped (no new comment or bug)
+	if err := bridge.processAlert(alert); err != nil {
+		t.Fatalf("Second processAlert failed: %v", err)
+	}
+	if commentCount != 1 {
+		t.Errorf("Second call: expected still 1 comment, got %d", commentCount)
+	}
+	if bugCount != 1 {
+		t.Errorf("Second call: expected still 1 bug, got %d", bugCount)
+	}
+
+	// Third call with resolved state: should process (state transition)
+	alert.Status = "resolved"
+	if err := bridge.processAlert(alert); err != nil {
+		t.Fatalf("Third processAlert failed: %v", err)
+	}
+	if commentCount != 2 {
+		t.Errorf("Third call: expected 2 comments, got %d", commentCount)
+	}
+	// No bug for healthy state
+	if bugCount != 1 {
+		t.Errorf("Third call: expected still 1 bug, got %d", bugCount)
+	}
+}
+
 func TestWebhookHandler_Unauthorized(t *testing.T) {
 	bridge := &Bridge{github: &GitHubClient{projectID: "test"}}
 	handler := bridge.WebhookHandler("correct-secret")
