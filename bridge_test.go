@@ -208,6 +208,324 @@ func TestProcessAlert_DedupSkipsRepeatState(t *testing.T) {
 	}
 }
 
+func TestFormatHealComment(t *testing.T) {
+	alert := Alert{
+		Status:      "resolved",
+		Labels:      map[string]string{"alertname": "Layer 8 Observability Degraded", "severity": "critical"},
+		Annotations: map[string]string{"summary": "L8 Observability: pod/fluent-bit-znsw9 failing"},
+		StartsAt:    "2026-06-04T16:52:58Z",
+		EndsAt:      "2026-06-04T17:38:03Z",
+	}
+
+	comment := FormatHealComment(alert)
+
+	for _, want := range []string{
+		"## Health Bridge: auto-close",
+		"Layer 8 Observability Degraded",
+		"2026-06-04T17:38:03Z",
+		"45m", // 16:52:58 → 17:38:03 rounds to 45m
+		"System healed — closing this bug automatically.",
+		"*Automated by health-bridge*",
+	} {
+		if !bytes.Contains([]byte(comment), []byte(want)) {
+			t.Errorf("heal comment missing %q\n---\n%s", want, comment)
+		}
+	}
+
+	// Unparseable timestamps: comment still renders, duration omitted.
+	alert.StartsAt = "not-a-timestamp"
+	comment = FormatHealComment(alert)
+	if bytes.Contains([]byte(comment), []byte("Outage duration")) {
+		t.Error("duration must be omitted when StartsAt does not parse")
+	}
+	if !bytes.Contains([]byte(comment), []byte("Layer 8 Observability Degraded")) {
+		t.Error("comment must still render without parseable timestamps")
+	}
+
+	// Clock skew (EndsAt before StartsAt): a negative duration would read as
+	// a bug in the comment — omit it.
+	alert.StartsAt = "2026-06-04T18:00:00Z"
+	comment = FormatHealComment(alert)
+	if bytes.Contains([]byte(comment), []byte("Outage duration")) {
+		t.Error("duration must be omitted when EndsAt precedes StartsAt")
+	}
+}
+
+func TestFindOpenBugs(t *testing.T) {
+	// Fixtures mirror the real frank-ops shape: Grafana's synthetic
+	// DatasourceError alertname is shared across layers, so matching must
+	// disambiguate via the Feature Issue ref in the bug body.
+	fixtures := []map[string]any{
+		{
+			"number": 38,
+			"title":  "[Bug] DatasourceError is dead — L24 Traefik: pod [no value] NotReady",
+			"body":   "## Auto-created by health-bridge\n\n**Feature Issue:** derio-net/frank-ops#24\n**Alert:** DatasourceError\n",
+		},
+		{
+			"number": 39,
+			"title":  "[Bug] DatasourceError is dead — L8 Observability: [no value] failing",
+			"body":   "## Auto-created by health-bridge\n\n**Feature Issue:** derio-net/frank-ops#8\n**Alert:** DatasourceError\n",
+		},
+		{
+			"number": 41,
+			"title":  "[Bug] DatasourceError is dead — L2 OS: [no value] failing",
+			"body":   "## Auto-created by health-bridge\n\n**Feature Issue:** derio-net/frank-ops#2\n**Alert:** DatasourceError\n",
+		},
+		{
+			// Historical duplicate for the same alert+feature as #38 —
+			// must also be returned so auto-close clears all of them.
+			"number": 45,
+			"title":  "[Bug] DatasourceError is dead — L24 Traefik: pod [no value] NotReady",
+			"body":   "## Auto-created by health-bridge\n\n**Feature Issue:** derio-net/frank-ops#24\n**Alert:** DatasourceError\n",
+		},
+		{
+			// A pull request (the REST issues list includes PRs, marked by the
+			// pull_request key) whose title/body coincidentally match — must be
+			// skipped so the bridge can never close a PR.
+			"number":       46,
+			"title":        "[Bug] DatasourceError is dead — L24 Traefik: pod [no value] NotReady",
+			"body":         "Quoting the bug for context:\n**Feature Issue:** derio-net/frank-ops#24\n**Alert:** DatasourceError\n",
+			"pull_request": map[string]any{"url": "https://api.github.com/repos/derio-net/frank-ops/pulls/46"},
+		},
+	}
+
+	mockGH := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == "GET" && r.URL.Path == "/repos/derio-net/frank-ops/issues" {
+			w.WriteHeader(http.StatusOK)
+			json.NewEncoder(w).Encode(fixtures)
+			return
+		}
+		w.WriteHeader(http.StatusNotFound)
+	}))
+	defer mockGH.Close()
+
+	origGraphQL := githubGraphQLURL
+	origREST := githubRESTURL
+	defer func() { setGitHubURLs(origGraphQL, origREST) }()
+	setGitHubURLs(mockGH.URL+"/graphql", mockGH.URL)
+
+	client := &GitHubClient{
+		token:      "test",
+		org:        "derio-net",
+		httpClient: mockGH.Client(),
+	}
+
+	tests := []struct {
+		name          string
+		alertName     string
+		featureNumber int
+		want          []int
+	}{
+		{"matches only the right layer's bug", "DatasourceError", 24, []int{38, 45}},
+		{"newline-terminated needle: #2 must not match #24", "DatasourceError", 2, []int{41}},
+		{"no match for other alert names", "OtherAlert", 24, nil},
+		{"no match for unknown feature number", "DatasourceError", 99, nil},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got, err := client.FindOpenBugs("frank-ops", tt.alertName, tt.featureNumber)
+			if err != nil {
+				t.Fatalf("FindOpenBugs error: %v", err)
+			}
+			if len(got) != len(tt.want) {
+				t.Fatalf("FindOpenBugs = %v, want %v", got, tt.want)
+			}
+			for i := range got {
+				if got[i] != tt.want[i] {
+					t.Errorf("FindOpenBugs = %v, want %v", got, tt.want)
+					break
+				}
+			}
+		})
+	}
+}
+
+func TestCloseBugIssue(t *testing.T) {
+	var gotComment string
+	var patchBody map[string]string
+	var commentBeforePatch bool
+
+	mockGH := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.Method == "POST" && r.URL.Path == "/repos/derio-net/frank-ops/issues/38/comments":
+			var payload map[string]string
+			json.NewDecoder(r.Body).Decode(&payload)
+			gotComment = payload["body"]
+			commentBeforePatch = patchBody == nil
+			w.WriteHeader(http.StatusCreated)
+			json.NewEncoder(w).Encode(map[string]any{"id": 1})
+		case r.Method == "PATCH" && r.URL.Path == "/repos/derio-net/frank-ops/issues/38":
+			json.NewDecoder(r.Body).Decode(&patchBody)
+			w.WriteHeader(http.StatusOK)
+			json.NewEncoder(w).Encode(map[string]any{"number": 38})
+		default:
+			w.WriteHeader(http.StatusNotFound)
+		}
+	}))
+	defer mockGH.Close()
+
+	origGraphQL := githubGraphQLURL
+	origREST := githubRESTURL
+	defer func() { setGitHubURLs(origGraphQL, origREST) }()
+	setGitHubURLs(mockGH.URL+"/graphql", mockGH.URL)
+
+	client := &GitHubClient{token: "test", org: "derio-net", httpClient: mockGH.Client()}
+
+	if err := client.CloseBugIssue("frank-ops", 38, "healed comment"); err != nil {
+		t.Fatalf("CloseBugIssue error: %v", err)
+	}
+	if gotComment != "healed comment" {
+		t.Errorf("comment body = %q, want %q", gotComment, "healed comment")
+	}
+	if !commentBeforePatch {
+		t.Error("heal comment must be posted before the close PATCH")
+	}
+	if patchBody["state"] != "closed" || patchBody["state_reason"] != "completed" {
+		t.Errorf("PATCH body = %v, want state=closed state_reason=completed", patchBody)
+	}
+}
+
+func TestCloseBugIssue_CommentFailureStillCloses(t *testing.T) {
+	var patched bool
+
+	mockGH := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.Method == "POST" && r.URL.Path == "/repos/derio-net/frank-ops/issues/38/comments":
+			w.WriteHeader(http.StatusInternalServerError)
+		case r.Method == "PATCH" && r.URL.Path == "/repos/derio-net/frank-ops/issues/38":
+			patched = true
+			w.WriteHeader(http.StatusOK)
+			json.NewEncoder(w).Encode(map[string]any{"number": 38})
+		default:
+			w.WriteHeader(http.StatusNotFound)
+		}
+	}))
+	defer mockGH.Close()
+
+	origGraphQL := githubGraphQLURL
+	origREST := githubRESTURL
+	defer func() { setGitHubURLs(origGraphQL, origREST) }()
+	setGitHubURLs(mockGH.URL+"/graphql", mockGH.URL)
+
+	client := &GitHubClient{token: "test", org: "derio-net", httpClient: mockGH.Client()}
+
+	if err := client.CloseBugIssue("frank-ops", 38, "healed comment"); err != nil {
+		t.Fatalf("CloseBugIssue must tolerate comment failure, got error: %v", err)
+	}
+	if !patched {
+		t.Error("close PATCH must still be sent when the comment POST fails")
+	}
+}
+
+func TestProcessAlert_ResolvedClosesOpenBugs(t *testing.T) {
+	openBugs := []map[string]any{
+		{
+			"number": 99,
+			"title":  "[Bug] Exercise Reminder Stale is dead — heartbeat stale",
+			"body":   "## Auto-created by health-bridge\n\n**Feature Issue:** derio-net/willikins#11\n**Alert:** Exercise Reminder Stale\n",
+		},
+	}
+	var bugCommentCount, patchCount int
+
+	mockGH := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.URL.Path == "/graphql":
+			w.WriteHeader(http.StatusOK)
+			json.NewEncoder(w).Encode(map[string]any{
+				"data": map[string]any{
+					"repository": map[string]any{
+						"issue": map[string]any{
+							"projectItems": map[string]any{
+								"nodes": []map[string]any{
+									{"id": "item-1", "project": map[string]any{"id": "proj-1"}},
+								},
+							},
+						},
+					},
+					"updateProjectV2ItemFieldValue": map[string]any{
+						"projectV2Item": map[string]any{"id": "item-1"},
+					},
+				},
+			})
+		case r.Method == "GET" && r.URL.Path == "/repos/derio-net/willikins/issues":
+			w.WriteHeader(http.StatusOK)
+			json.NewEncoder(w).Encode(openBugs)
+		case r.Method == "POST" && r.URL.Path == "/repos/derio-net/willikins/issues/99/comments":
+			bugCommentCount++
+			w.WriteHeader(http.StatusCreated)
+			json.NewEncoder(w).Encode(map[string]any{"id": 1})
+		case r.Method == "PATCH" && r.URL.Path == "/repos/derio-net/willikins/issues/99":
+			patchCount++
+			openBugs = []map[string]any{} // closing empties the open-bug list
+			w.WriteHeader(http.StatusOK)
+			json.NewEncoder(w).Encode(map[string]any{"number": 99})
+		case r.Method == "POST" && r.URL.Path == "/repos/derio-net/willikins/issues/11/comments":
+			// tracker transition comment — uninteresting here
+			w.WriteHeader(http.StatusCreated)
+			json.NewEncoder(w).Encode(map[string]any{"id": 2})
+		default:
+			w.WriteHeader(http.StatusNotFound)
+		}
+	}))
+	defer mockGH.Close()
+
+	origGraphQL := githubGraphQLURL
+	origREST := githubRESTURL
+	defer func() { setGitHubURLs(origGraphQL, origREST) }()
+	setGitHubURLs(mockGH.URL+"/graphql", mockGH.URL)
+
+	bridge := &Bridge{
+		github: &GitHubClient{
+			token:         "test",
+			org:           "derio-net",
+			projectID:     "proj-1",
+			fieldID:       "field-1",
+			optionIDs:     map[string]string{"healthy": "opt-1", "dead": "opt-2", "degraded": "opt-3"},
+			httpClient:    mockGH.Client(),
+			projectNumber: 1,
+		},
+		lastState: make(map[string]string),
+	}
+
+	alert := Alert{
+		Status:      "resolved",
+		Labels:      map[string]string{"alertname": "Exercise Reminder Stale", "severity": "critical", "github_issue": "willikins#11"},
+		Annotations: map[string]string{"summary": "Exercise reminder heartbeat is stale"},
+		StartsAt:    "2026-06-04T16:52:58Z",
+		EndsAt:      "2026-06-04T17:38:03Z",
+	}
+
+	// First resolved: must close the matching open bug (comment + PATCH).
+	if err := bridge.processAlert(alert); err != nil {
+		t.Fatalf("First processAlert failed: %v", err)
+	}
+	if bugCommentCount != 1 {
+		t.Errorf("First resolved: expected 1 heal comment on bug, got %d", bugCommentCount)
+	}
+	if patchCount != 1 {
+		t.Errorf("First resolved: expected 1 close PATCH, got %d", patchCount)
+	}
+
+	// Repeat resolved (lastState dedup now reports repeat state): the close
+	// path must still run — and be a clean no-op with no bugs left open.
+	if err := bridge.processAlert(alert); err != nil {
+		t.Fatalf("Second processAlert failed: %v", err)
+	}
+	if patchCount != 1 {
+		t.Errorf("Repeat resolved: expected still 1 close PATCH (idempotent no-op), got %d", patchCount)
+	}
+
+	// Resolved for an alert with no open bugs: no-op.
+	alert.Labels["alertname"] = "Some Other Alert"
+	if err := bridge.processAlert(alert); err != nil {
+		t.Fatalf("Third processAlert failed: %v", err)
+	}
+	if patchCount != 1 {
+		t.Errorf("No-bug resolved: expected still 1 close PATCH, got %d", patchCount)
+	}
+}
+
 func TestWebhookHandler_Unauthorized(t *testing.T) {
 	bridge := &Bridge{github: &GitHubClient{projectID: "test"}}
 	handler := bridge.WebhookHandler("correct-secret")

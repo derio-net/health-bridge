@@ -7,6 +7,7 @@ import (
 	"io"
 	"log"
 	"net/http"
+	"strings"
 	"time"
 )
 
@@ -278,48 +279,102 @@ This feature has been marked as **dead** by the health monitoring system.
 	return result.HTMLURL, nil
 }
 
-// HasOpenBug checks whether an open bug issue already exists for a given alert name.
-// Used as a restart safety net — prevents duplicate bug creation when in-memory state is lost.
-func (c *GitHubClient) HasOpenBug(repo, alertName string) (bool, error) {
+// FindOpenBugs returns the numbers of all open bug issues created for a given
+// alert on a given feature issue. Matching requires BOTH the title prefix
+// "[Bug] <alertName> is dead" AND the feature-issue ref line in the body —
+// Grafana's synthetic DatasourceError alertname is shared across layers, so
+// the title alone is ambiguous. The ref needle is newline-terminated (the body
+// template guarantees "#%d\n**Alert:**") so "...#2" never matches "...#24".
+func (c *GitHubClient) FindOpenBugs(repo, alertName string, featureNumber int) ([]int, error) {
 	url := fmt.Sprintf("%s/repos/%s/%s/issues?labels=bug&state=open&per_page=50", githubRESTURL, c.org, repo)
 
 	req, err := http.NewRequest("GET", url, nil)
 	if err != nil {
-		return false, err
+		return nil, err
 	}
 	req.Header.Set("Authorization", "Bearer "+c.token)
 	req.Header.Set("Accept", "application/vnd.github+json")
 
 	resp, err := c.httpClient.Do(req)
 	if err != nil {
-		return false, fmt.Errorf("http request: %w", err)
+		return nil, fmt.Errorf("http request: %w", err)
 	}
 	defer resp.Body.Close()
 
 	body, err := io.ReadAll(resp.Body)
 	if err != nil {
-		return false, fmt.Errorf("read response: %w", err)
+		return nil, fmt.Errorf("read response: %w", err)
 	}
 
 	if resp.StatusCode != http.StatusOK {
-		return false, fmt.Errorf("github API returned %d: %s", resp.StatusCode, string(body))
+		return nil, fmt.Errorf("github API returned %d: %s", resp.StatusCode, string(body))
 	}
 
 	var issues []struct {
-		Title string `json:"title"`
+		Number      int             `json:"number"`
+		Title       string          `json:"title"`
+		Body        string          `json:"body"`
+		PullRequest json.RawMessage `json:"pull_request"`
 	}
 	if err := json.Unmarshal(body, &issues); err != nil {
-		return false, fmt.Errorf("parse issues: %w", err)
+		return nil, fmt.Errorf("parse issues: %w", err)
 	}
 
-	prefix := fmt.Sprintf("[Bug] %s is dead", alertName)
+	titlePrefix := fmt.Sprintf("[Bug] %s is dead", alertName)
+	refNeedle := fmt.Sprintf("**Feature Issue:** %s/%s#%d\n", c.org, repo, featureNumber)
+
+	var matches []int
 	for _, issue := range issues {
-		if len(issue.Title) >= len(prefix) && issue.Title[:len(prefix)] == prefix {
-			return true, nil
+		if issue.PullRequest != nil {
+			// The REST issues list includes PRs (pull_request key present) —
+			// never match one, the bridge must only ever close its own bugs.
+			continue
+		}
+		if strings.HasPrefix(issue.Title, titlePrefix) && strings.Contains(issue.Body, refNeedle) {
+			matches = append(matches, issue.Number)
 		}
 	}
 
-	return false, nil
+	return matches, nil
+}
+
+// CloseBugIssue posts a heal comment on a bug Issue, then closes it with
+// state_reason "completed". A comment failure is logged but does not abort
+// the close — mirroring the tracker-comment tolerance in processAlert.
+func (c *GitHubClient) CloseBugIssue(repo string, number int, comment string) error {
+	if err := c.AddIssueComment(repo, number, comment); err != nil {
+		log.Printf("Warning: failed to add heal comment to %s#%d (closing anyway): %v", repo, number, err)
+	}
+
+	payload, err := json.Marshal(map[string]string{
+		"state":        "closed",
+		"state_reason": "completed",
+	})
+	if err != nil {
+		return err
+	}
+
+	url := fmt.Sprintf("%s/repos/%s/%s/issues/%d", githubRESTURL, c.org, repo, number)
+	req, err := http.NewRequest("PATCH", url, bytes.NewReader(payload))
+	if err != nil {
+		return err
+	}
+	req.Header.Set("Authorization", "Bearer "+c.token)
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Accept", "application/vnd.github+json")
+
+	resp, err := c.httpClient.Do(req)
+	if err != nil {
+		return fmt.Errorf("http request: %w", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		respBody, _ := io.ReadAll(resp.Body)
+		return fmt.Errorf("github API returned %d: %s", resp.StatusCode, string(respBody))
+	}
+
+	return nil
 }
 
 // AddIssueComment adds a comment to a GitHub Issue via REST API.
