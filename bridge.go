@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"strconv"
 	"strings"
+	"time"
 )
 
 // Bridge is the core service that processes Grafana alerts and updates GitHub.
@@ -106,6 +107,27 @@ func (b *Bridge) processAlert(alert Alert) error {
 		return fmt.Errorf("update lifecycle %s → %s: %w", issueRef, newState, err)
 	}
 
+	// On resolved, auto-close any open bug Issues this alert created.
+	// Deliberately BEFORE the lastState dedup (dedup is keyed per tracker,
+	// shared by multiple alerts — a deduped repeat-resolved must still close;
+	// the operation is idempotent: no open bugs ⇒ no-op) and NOT gated on
+	// severity (a severity-label edit between fire and resolve must not
+	// strand a bug).
+	if alert.Status == "resolved" {
+		alertName := alert.Labels["alertname"]
+		bugs, err := b.github.FindOpenBugs(repo, alertName, number)
+		if err != nil {
+			log.Printf("Warning: failed to find open bugs for %s: %v", issueRef, err)
+		}
+		for _, n := range bugs {
+			if err := b.github.CloseBugIssue(repo, n, FormatHealComment(alert)); err != nil {
+				log.Printf("Warning: failed to close bug %s#%d: %v", repo, n, err)
+			} else {
+				log.Printf("Closed bug issue %s#%d (alert %s resolved)", repo, n, alertName)
+			}
+		}
+	}
+
 	// Dedup: only comment and create bugs on actual state transitions
 	prevState := b.lastState[issueRef]
 	b.lastState[issueRef] = newState
@@ -123,14 +145,16 @@ func (b *Bridge) processAlert(alert Alert) error {
 
 	// On dead transition, create a bug Issue linked to the feature Issue
 	if newState == "dead" {
-		// Safety net: check for existing open bug before creating (handles restarts)
+		// Safety net: check for existing open bug before creating (handles restarts).
+		// Feature-ref-aware match: layers sharing an alertname (DatasourceError)
+		// must not suppress each other's bugs.
 		alertName := alert.Labels["alertname"]
-		exists, err := b.github.HasOpenBug(repo, alertName)
+		existing, err := b.github.FindOpenBugs(repo, alertName, number)
 		if err != nil {
 			log.Printf("Warning: failed to check for existing bug for %s: %v", issueRef, err)
 			// Fall through to create — better a duplicate than a missing bug
 		}
-		if exists {
+		if len(existing) > 0 {
 			log.Printf("Dedup: open bug already exists for %s in %s, skipping creation", alertName, repo)
 		} else {
 			bugURL, err := b.github.CreateBugIssue(repo, number, alert)
@@ -180,6 +204,29 @@ func MapAlertToState(alertStatus, severity string) string {
 	default:
 		return "degraded" // Unknown status defaults to degraded
 	}
+}
+
+// FormatHealComment creates the markdown comment posted on a bug Issue when
+// its alert resolves and the bug is auto-closed. The outage duration is
+// computed from the resolved alert's StartsAt→EndsAt and omitted when either
+// timestamp fails to parse.
+func FormatHealComment(alert Alert) string {
+	var sb strings.Builder
+	sb.WriteString("## Health Bridge: auto-close\n\n")
+	sb.WriteString(fmt.Sprintf("**Alert:** %s\n", alert.Labels["alertname"]))
+	sb.WriteString(fmt.Sprintf("**Severity:** %s\n", alert.Labels["severity"]))
+	if summary := alert.Annotations["summary"]; summary != "" {
+		sb.WriteString(fmt.Sprintf("**Summary:** %s\n", summary))
+	}
+	sb.WriteString(fmt.Sprintf("**Resolved:** %s\n", alert.EndsAt))
+	start, errStart := time.Parse(time.RFC3339, alert.StartsAt)
+	end, errEnd := time.Parse(time.RFC3339, alert.EndsAt)
+	if errStart == nil && errEnd == nil {
+		sb.WriteString(fmt.Sprintf("**Outage duration:** %s\n", end.Sub(start).Round(time.Minute)))
+	}
+	sb.WriteString("\nSystem healed — closing this bug automatically.\n")
+	sb.WriteString("\n---\n*Automated by health-bridge*\n")
+	return sb.String()
 }
 
 // FormatComment creates a markdown comment for a GitHub Issue describing the alert.
