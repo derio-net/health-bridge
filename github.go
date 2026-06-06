@@ -311,9 +311,10 @@ func (c *GitHubClient) FindOpenBugs(repo, alertName string, featureNumber int) (
 	}
 
 	var issues []struct {
-		Number int    `json:"number"`
-		Title  string `json:"title"`
-		Body   string `json:"body"`
+		Number      int             `json:"number"`
+		Title       string          `json:"title"`
+		Body        string          `json:"body"`
+		PullRequest json.RawMessage `json:"pull_request"`
 	}
 	if err := json.Unmarshal(body, &issues); err != nil {
 		return nil, fmt.Errorf("parse issues: %w", err)
@@ -324,6 +325,11 @@ func (c *GitHubClient) FindOpenBugs(repo, alertName string, featureNumber int) (
 
 	var matches []int
 	for _, issue := range issues {
+		if issue.PullRequest != nil {
+			// The REST issues list includes PRs (pull_request key present) —
+			// never match one, the bridge must only ever close its own bugs.
+			continue
+		}
 		if strings.HasPrefix(issue.Title, titlePrefix) && strings.Contains(issue.Body, refNeedle) {
 			matches = append(matches, issue.Number)
 		}

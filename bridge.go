@@ -221,7 +221,7 @@ func FormatHealComment(alert Alert) string {
 	sb.WriteString(fmt.Sprintf("**Resolved:** %s\n", alert.EndsAt))
 	start, errStart := time.Parse(time.RFC3339, alert.StartsAt)
 	end, errEnd := time.Parse(time.RFC3339, alert.EndsAt)
-	if errStart == nil && errEnd == nil {
+	if errStart == nil && errEnd == nil && !end.Before(start) {
 		sb.WriteString(fmt.Sprintf("**Outage duration:** %s\n", end.Sub(start).Round(time.Minute)))
 	}
 	sb.WriteString("\nSystem healed — closing this bug automatically.\n")

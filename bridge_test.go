@@ -241,6 +241,14 @@ func TestFormatHealComment(t *testing.T) {
 	if !bytes.Contains([]byte(comment), []byte("Layer 8 Observability Degraded")) {
 		t.Error("comment must still render without parseable timestamps")
 	}
+
+	// Clock skew (EndsAt before StartsAt): a negative duration would read as
+	// a bug in the comment — omit it.
+	alert.StartsAt = "2026-06-04T18:00:00Z"
+	comment = FormatHealComment(alert)
+	if bytes.Contains([]byte(comment), []byte("Outage duration")) {
+		t.Error("duration must be omitted when EndsAt precedes StartsAt")
+	}
 }
 
 func TestFindOpenBugs(t *testing.T) {
@@ -269,6 +277,15 @@ func TestFindOpenBugs(t *testing.T) {
 			"number": 45,
 			"title":  "[Bug] DatasourceError is dead — L24 Traefik: pod [no value] NotReady",
 			"body":   "## Auto-created by health-bridge\n\n**Feature Issue:** derio-net/frank-ops#24\n**Alert:** DatasourceError\n",
+		},
+		{
+			// A pull request (the REST issues list includes PRs, marked by the
+			// pull_request key) whose title/body coincidentally match — must be
+			// skipped so the bridge can never close a PR.
+			"number":       46,
+			"title":        "[Bug] DatasourceError is dead — L24 Traefik: pod [no value] NotReady",
+			"body":         "Quoting the bug for context:\n**Feature Issue:** derio-net/frank-ops#24\n**Alert:** DatasourceError\n",
+			"pull_request": map[string]any{"url": "https://api.github.com/repos/derio-net/frank-ops/pulls/46"},
 		},
 	}
 
