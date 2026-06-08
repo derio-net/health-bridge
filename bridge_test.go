@@ -526,6 +526,229 @@ func TestProcessAlert_ResolvedClosesOpenBugs(t *testing.T) {
 	}
 }
 
+// blindAlertMock builds a mock GitHub server for the blind-state tests. It
+// captures the optionId of the last lifecycle mutation (so a test can assert
+// which state was set) and counts bug-creation POSTs. The open-bug GET returns
+// the supplied fixtures.
+func blindAlertMock(t *testing.T, repo string, openBugs []map[string]any, lastOptionID *string, bugCount *int) *httptest.Server {
+	t.Helper()
+	return httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/graphql" {
+			var gq struct {
+				Variables map[string]any `json:"variables"`
+			}
+			json.NewDecoder(r.Body).Decode(&gq)
+			if oid, ok := gq.Variables["optionId"].(string); ok {
+				*lastOptionID = oid
+			}
+			w.WriteHeader(http.StatusOK)
+			json.NewEncoder(w).Encode(map[string]any{
+				"data": map[string]any{
+					"repository": map[string]any{
+						"issue": map[string]any{
+							"projectItems": map[string]any{
+								"nodes": []map[string]any{
+									{"id": "item-1", "project": map[string]any{"id": "proj-1"}},
+								},
+							},
+						},
+					},
+					"updateProjectV2ItemFieldValue": map[string]any{
+						"projectV2Item": map[string]any{"id": "item-1"},
+					},
+				},
+			})
+			return
+		}
+		switch {
+		case r.Method == "GET" && r.URL.Path == "/repos/derio-net/"+repo+"/issues":
+			w.WriteHeader(http.StatusOK)
+			json.NewEncoder(w).Encode(openBugs)
+		case r.Method == "POST" && r.URL.Path == "/repos/derio-net/"+repo+"/issues":
+			*bugCount++
+			w.WriteHeader(http.StatusCreated)
+			json.NewEncoder(w).Encode(map[string]any{"html_url": "https://github.com/derio-net/" + repo + "/issues/100"})
+		default:
+			// All other REST writes (tracker/bug comments, close PATCH) succeed.
+			if r.Method == "PATCH" {
+				w.WriteHeader(http.StatusOK)
+			} else {
+				w.WriteHeader(http.StatusCreated)
+			}
+			json.NewEncoder(w).Encode(map[string]any{"id": 1})
+		}
+	}))
+}
+
+func newBlindTestBridge(client *http.Client) *Bridge {
+	return &Bridge{
+		github: &GitHubClient{
+			token:         "test",
+			org:           "derio-net",
+			projectID:     "proj-1",
+			fieldID:       "field-1",
+			optionIDs:     map[string]string{"healthy": "opt-1", "dead": "opt-2", "degraded": "opt-3"},
+			httpClient:    client,
+			projectNumber: 1,
+		},
+		lastState: make(map[string]string),
+	}
+}
+
+// (a) A firing DatasourceError is blindness, not death: the tracker is set to
+// degraded (opt-3) and NO bug is created.
+func TestProcessAlert_DatasourceError_Degraded_NoBug(t *testing.T) {
+	var lastOptionID string
+	var bugCount int
+	mockGH := blindAlertMock(t, "frank-ops", []map[string]any{}, &lastOptionID, &bugCount)
+	defer mockGH.Close()
+	origGraphQL, origREST := githubGraphQLURL, githubRESTURL
+	defer func() { setGitHubURLs(origGraphQL, origREST) }()
+	setGitHubURLs(mockGH.URL+"/graphql", mockGH.URL)
+
+	bridge := newBlindTestBridge(mockGH.Client())
+	alert := Alert{
+		Status:      "firing",
+		Labels:      map[string]string{"alertname": "DatasourceError", "severity": "critical", "github_issue": "frank-ops#99"},
+		Annotations: map[string]string{"summary": "L6 ArgoCD: pod [no value] NotReady"},
+		StartsAt:    "2026-06-08T04:03:00Z",
+	}
+	if err := bridge.processAlert(alert); err != nil {
+		t.Fatalf("processAlert failed: %v", err)
+	}
+	if lastOptionID != "opt-3" {
+		t.Errorf("DatasourceError firing: lifecycle optionId = %q, want %q (degraded)", lastOptionID, "opt-3")
+	}
+	if bugCount != 0 {
+		t.Errorf("DatasourceError firing: expected 0 bugs created, got %d", bugCount)
+	}
+}
+
+// (b) NoData is also blindness ⇒ degraded, no bug.
+func TestProcessAlert_NoData_Degraded_NoBug(t *testing.T) {
+	var lastOptionID string
+	var bugCount int
+	mockGH := blindAlertMock(t, "frank-ops", []map[string]any{}, &lastOptionID, &bugCount)
+	defer mockGH.Close()
+	origGraphQL, origREST := githubGraphQLURL, githubRESTURL
+	defer func() { setGitHubURLs(origGraphQL, origREST) }()
+	setGitHubURLs(mockGH.URL+"/graphql", mockGH.URL)
+
+	bridge := newBlindTestBridge(mockGH.Client())
+	alert := Alert{
+		Status:      "firing",
+		Labels:      map[string]string{"alertname": "NoData", "severity": "critical", "github_issue": "frank-ops#99"},
+		Annotations: map[string]string{"summary": "L8 Observability: [no value] failing"},
+		StartsAt:    "2026-06-08T04:03:00Z",
+	}
+	if err := bridge.processAlert(alert); err != nil {
+		t.Fatalf("processAlert failed: %v", err)
+	}
+	if lastOptionID != "opt-3" {
+		t.Errorf("NoData firing: lifecycle optionId = %q, want %q (degraded)", lastOptionID, "opt-3")
+	}
+	if bugCount != 0 {
+		t.Errorf("NoData firing: expected 0 bugs created, got %d", bugCount)
+	}
+}
+
+// (c) Regression guard: a REAL critical alert (not blind) still maps to dead
+// (opt-2) and still creates a bug. This must stay green before and after the fix.
+func TestProcessAlert_RealCritical_Dead_WithBug(t *testing.T) {
+	var lastOptionID string
+	var bugCount int
+	mockGH := blindAlertMock(t, "frank-ops", []map[string]any{}, &lastOptionID, &bugCount)
+	defer mockGH.Close()
+	origGraphQL, origREST := githubGraphQLURL, githubRESTURL
+	defer func() { setGitHubURLs(origGraphQL, origREST) }()
+	setGitHubURLs(mockGH.URL+"/graphql", mockGH.URL)
+
+	bridge := newBlindTestBridge(mockGH.Client())
+	alert := Alert{
+		Status:      "firing",
+		Labels:      map[string]string{"alertname": "Agent Pod Not Running", "severity": "critical", "github_issue": "frank-ops#99"},
+		Annotations: map[string]string{"summary": "Secure agent pod not in Running phase"},
+		StartsAt:    "2026-06-08T04:03:00Z",
+	}
+	if err := bridge.processAlert(alert); err != nil {
+		t.Fatalf("processAlert failed: %v", err)
+	}
+	if lastOptionID != "opt-2" {
+		t.Errorf("real critical firing: lifecycle optionId = %q, want %q (dead)", lastOptionID, "opt-2")
+	}
+	if bugCount != 1 {
+		t.Errorf("real critical firing: expected 1 bug created, got %d", bugCount)
+	}
+}
+
+// (d) Cross-alertname heal: a bug created under "DatasourceError" must be
+// closed when the tracker resolves under its REAL alertname (which differs).
+// This is the stranding bug from the 2026-06-08 outage.
+func TestProcessAlert_CrossAlertnameHeal(t *testing.T) {
+	openBugs := []map[string]any{
+		{
+			"number": 50,
+			"title":  "[Bug] DatasourceError is dead — L18 Persistent Agent: [no value]",
+			"body":   "## Auto-created by health-bridge\n\n**Feature Issue:** derio-net/frank-ops#99\n**Alert:** DatasourceError\n",
+		},
+	}
+	var patchCount int
+
+	mockGH := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.URL.Path == "/graphql":
+			w.WriteHeader(http.StatusOK)
+			json.NewEncoder(w).Encode(map[string]any{
+				"data": map[string]any{
+					"repository": map[string]any{
+						"issue": map[string]any{
+							"projectItems": map[string]any{
+								"nodes": []map[string]any{
+									{"id": "item-1", "project": map[string]any{"id": "proj-1"}},
+								},
+							},
+						},
+					},
+					"updateProjectV2ItemFieldValue": map[string]any{
+						"projectV2Item": map[string]any{"id": "item-1"},
+					},
+				},
+			})
+		case r.Method == "GET" && r.URL.Path == "/repos/derio-net/frank-ops/issues":
+			w.WriteHeader(http.StatusOK)
+			json.NewEncoder(w).Encode(openBugs)
+		case r.Method == "PATCH" && r.URL.Path == "/repos/derio-net/frank-ops/issues/50":
+			patchCount++
+			openBugs = []map[string]any{}
+			w.WriteHeader(http.StatusOK)
+			json.NewEncoder(w).Encode(map[string]any{"number": 50})
+		default:
+			w.WriteHeader(http.StatusCreated)
+			json.NewEncoder(w).Encode(map[string]any{"id": 1})
+		}
+	}))
+	defer mockGH.Close()
+	origGraphQL, origREST := githubGraphQLURL, githubRESTURL
+	defer func() { setGitHubURLs(origGraphQL, origREST) }()
+	setGitHubURLs(mockGH.URL+"/graphql", mockGH.URL)
+
+	bridge := newBlindTestBridge(mockGH.Client())
+	// Resolve arrives under the REAL rule name, not "DatasourceError".
+	alert := Alert{
+		Status:      "resolved",
+		Labels:      map[string]string{"alertname": "Layer 18 Persistent Agent Heartbeat Stale", "severity": "critical", "github_issue": "frank-ops#99"},
+		Annotations: map[string]string{"summary": "Persistent agent heartbeat recovered"},
+		StartsAt:    "2026-06-08T04:03:00Z",
+		EndsAt:      "2026-06-08T04:51:00Z",
+	}
+	if err := bridge.processAlert(alert); err != nil {
+		t.Fatalf("processAlert failed: %v", err)
+	}
+	if patchCount != 1 {
+		t.Errorf("cross-alertname heal: expected the DatasourceError bug closed (1 PATCH), got %d", patchCount)
+	}
+}
+
 func TestWebhookHandler_Unauthorized(t *testing.T) {
 	bridge := &Bridge{github: &GitHubClient{projectID: "test"}}
 	handler := bridge.WebhookHandler("correct-secret")

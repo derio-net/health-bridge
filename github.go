@@ -279,13 +279,19 @@ This feature has been marked as **dead** by the health monitoring system.
 	return result.HTMLURL, nil
 }
 
-// FindOpenBugs returns the numbers of all open bug issues created for a given
-// alert on a given feature issue. Matching requires BOTH the title prefix
-// "[Bug] <alertName> is dead" AND the feature-issue ref line in the body —
-// Grafana's synthetic DatasourceError alertname is shared across layers, so
-// the title alone is ambiguous. The ref needle is newline-terminated (the body
-// template guarantees "#%d\n**Alert:**") so "...#2" never matches "...#24".
-func (c *GitHubClient) FindOpenBugs(repo, alertName string, featureNumber int) ([]int, error) {
+// openBugIssue is the subset of the REST issue payload the bridge needs to
+// decide whether a bug issue belongs to a given alert/feature.
+type openBugIssue struct {
+	Number      int             `json:"number"`
+	Title       string          `json:"title"`
+	Body        string          `json:"body"`
+	PullRequest json.RawMessage `json:"pull_request"`
+}
+
+// fetchOpenBugIssues lists the repo's open issues labelled "bug". The REST
+// issues list includes PRs (marked by a non-nil pull_request key); callers MUST
+// skip them so the bridge never closes a PR.
+func (c *GitHubClient) fetchOpenBugIssues(repo string) ([]openBugIssue, error) {
 	url := fmt.Sprintf("%s/repos/%s/%s/issues?labels=bug&state=open&per_page=50", githubRESTURL, c.org, repo)
 
 	req, err := http.NewRequest("GET", url, nil)
@@ -305,32 +311,72 @@ func (c *GitHubClient) FindOpenBugs(repo, alertName string, featureNumber int) (
 	if err != nil {
 		return nil, fmt.Errorf("read response: %w", err)
 	}
-
 	if resp.StatusCode != http.StatusOK {
 		return nil, fmt.Errorf("github API returned %d: %s", resp.StatusCode, string(body))
 	}
 
-	var issues []struct {
-		Number      int             `json:"number"`
-		Title       string          `json:"title"`
-		Body        string          `json:"body"`
-		PullRequest json.RawMessage `json:"pull_request"`
-	}
+	var issues []openBugIssue
 	if err := json.Unmarshal(body, &issues); err != nil {
 		return nil, fmt.Errorf("parse issues: %w", err)
 	}
+	return issues, nil
+}
+
+// featureRefNeedle is the newline-terminated body marker tying a bug to its
+// feature tracker. The body template emits "#%d\n**Alert:**", so the trailing
+// "\n" stops "...#2" from matching "...#24".
+func (c *GitHubClient) featureRefNeedle(repo string, featureNumber int) string {
+	return fmt.Sprintf("**Feature Issue:** %s/%s#%d\n", c.org, repo, featureNumber)
+}
+
+// FindOpenBugs returns the numbers of all open bug issues created for a given
+// alert on a given feature issue. Matching requires BOTH the title prefix
+// "[Bug] <alertName> is dead" AND the feature-issue ref line in the body —
+// Grafana's synthetic DatasourceError alertname is shared across layers, so the
+// title alone is ambiguous. Used by the create-dedup path so two distinct real
+// alerts on one tracker each keep their own bug.
+func (c *GitHubClient) FindOpenBugs(repo, alertName string, featureNumber int) ([]int, error) {
+	issues, err := c.fetchOpenBugIssues(repo)
+	if err != nil {
+		return nil, err
+	}
 
 	titlePrefix := fmt.Sprintf("[Bug] %s is dead", alertName)
-	refNeedle := fmt.Sprintf("**Feature Issue:** %s/%s#%d\n", c.org, repo, featureNumber)
+	refNeedle := c.featureRefNeedle(repo, featureNumber)
 
 	var matches []int
 	for _, issue := range issues {
 		if issue.PullRequest != nil {
-			// The REST issues list includes PRs (pull_request key present) —
-			// never match one, the bridge must only ever close its own bugs.
 			continue
 		}
 		if strings.HasPrefix(issue.Title, titlePrefix) && strings.Contains(issue.Body, refNeedle) {
+			matches = append(matches, issue.Number)
+		}
+	}
+
+	return matches, nil
+}
+
+// FindOpenBugsByFeature returns the numbers of all open bug issues whose body
+// references the given feature tracker, REGARDLESS of alertname. Used by the
+// heal path so a tracker returning to healthy closes every bug it owns —
+// including bugs whose firing alertname (e.g. the synthetic "DatasourceError")
+// differs from the alertname of the resolve that actually arrives. This is the
+// fix for the 2026-06-08 stranding incident.
+func (c *GitHubClient) FindOpenBugsByFeature(repo string, featureNumber int) ([]int, error) {
+	issues, err := c.fetchOpenBugIssues(repo)
+	if err != nil {
+		return nil, err
+	}
+
+	refNeedle := c.featureRefNeedle(repo, featureNumber)
+
+	var matches []int
+	for _, issue := range issues {
+		if issue.PullRequest != nil {
+			continue
+		}
+		if strings.Contains(issue.Body, refNeedle) {
 			matches = append(matches, issue.Number)
 		}
 	}
