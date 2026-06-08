@@ -102,6 +102,14 @@ func (b *Bridge) processAlert(alert Alert) error {
 
 	newState := MapAlertToState(alert.Status, alert.Labels["severity"])
 
+	// Blindness ≠ death: a firing DatasourceError/NoData means we lost sight of
+	// the layer, not that it died. Cap it at degraded and never manufacture a
+	// bug from it (the 2026-06-08 power-outage storm fabricated 5 such bugs).
+	blind := isBlindAlert(alert.Labels["alertname"])
+	if alert.Status == "firing" && blind && newState == "dead" {
+		newState = "degraded"
+	}
+
 	// Update lifecycle state on project board (idempotent — always safe)
 	if err := b.github.UpdateLifecycleState(repo, number, newState); err != nil {
 		return fmt.Errorf("update lifecycle %s → %s: %w", issueRef, newState, err)
@@ -115,7 +123,10 @@ func (b *Bridge) processAlert(alert Alert) error {
 	// strand a bug).
 	if alert.Status == "resolved" {
 		alertName := alert.Labels["alertname"]
-		bugs, err := b.github.FindOpenBugs(repo, alertName, number)
+		// Match by feature ref alone (alertname-agnostic): the resolve often
+		// arrives under a different alertname than the one that created the bug
+		// (e.g. a "DatasourceError" bug healed by the real per-rule resolve).
+		bugs, err := b.github.FindOpenBugsByFeature(repo, number)
 		if err != nil {
 			log.Printf("Warning: failed to find open bugs for %s: %v", issueRef, err)
 		}
@@ -143,8 +154,10 @@ func (b *Bridge) processAlert(alert Alert) error {
 		log.Printf("Warning: failed to add comment to %s (state update succeeded): %v", issueRef, err)
 	}
 
-	// On dead transition, create a bug Issue linked to the feature Issue
-	if newState == "dead" {
+	// On dead transition, create a bug Issue linked to the feature Issue.
+	// Blind alerts never reach here (capped at degraded above); the !blind
+	// guard documents that invariant.
+	if newState == "dead" && !blind {
 		// Safety net: check for existing open bug before creating (handles restarts).
 		// Feature-ref-aware match: layers sharing an alertname (DatasourceError)
 		// must not suppress each other's bugs.
@@ -185,6 +198,19 @@ func ParseIssueRef(ref string) (repo string, number int, err error) {
 		return "", 0, fmt.Errorf("invalid issue ref: repo=%q number=%d", repo, number)
 	}
 	return repo, number, nil
+}
+
+// isBlindAlert reports whether the alert name means "monitoring cannot see this
+// layer" (Grafana built-ins raised when a query errors or returns no data)
+// rather than a confirmed fault. Such alerts must not be treated as death:
+// they carry the affected rule's github_issue label but their templates can't
+// resolve real data (summaries render "[no value]").
+func isBlindAlert(alertname string) bool {
+	switch alertname {
+	case "DatasourceError", "NoData":
+		return true
+	}
+	return false
 }
 
 // MapAlertToState maps Grafana alert status and severity to a lifecycle state.
